@@ -8,6 +8,7 @@
 	<suppress files="build[\\/].*" checks=".*"/>
 	<suppress files="target[\\/].*" checks=".*"/>
 	<suppress files="k8s[\\/]gateway\.yml" checks="NoHttp"/>
+	<suppress files="k8s[\\/]petclinic-canary\.yml" checks="NoHttp"/>
 	<suppress files="k8s[\\/]logging\.yml" checks="NoHttp"/>
 	<suppress files="k8s[\\/]monitoring-stack\.yml" checks="NoHttp"/>
 	<suppress files=".+\.(jar|git|ico|p12|gif|jks|jpg|svg|log)" checks="NoHttp"/>

@@ -13,7 +13,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: migrator
-          image: postgres:16-alpine
+          image: postgres:18.4
           env:
             - name: PGPASSWORD_SOURCE
               valueFrom:
@@ -35,9 +35,25 @@ spec:
                 -h "$SRC" -U user -d petclinic \
                 --data-only --inserts \
                 -t vets -t specialties -t vet_specialties \
-              | PGPASSWORD="$PGPASSWORD_TARGET" psql \
-                -h "$DST" -U vetuser -d vetdb
+                --file=/tmp/historical-vets.sql
+
+              sed '/^SET transaction_timeout = /d' \
+                /tmp/historical-vets.sql > /tmp/historical-vets-pg16.sql
+
+              PGPASSWORD="$PGPASSWORD_TARGET" psql \
+                -X --no-psqlrc --single-transaction --set=ON_ERROR_STOP=1 \
+                -h "$DST" -U vetuser -d vetdb \
+                -c "TRUNCATE TABLE vet_specialties, vets, specialties RESTART IDENTITY" \
+                --file=/tmp/historical-vets-pg16.sql
 
               echo "=== Vérification ==="
-              PGPASSWORD="$PGPASSWORD_TARGET" psql -h "$DST" -U vetuser -d vetdb \
-                -c "SELECT count(*) AS total_vets FROM vets;"
+              SRC_COUNTS=$(PGPASSWORD="$PGPASSWORD_SOURCE" psql \
+                -h "$SRC" -U user -d petclinic -XAt \
+                -c "SELECT (SELECT count(*) FROM vets) || ':' || (SELECT count(*) FROM specialties) || ':' || (SELECT count(*) FROM vet_specialties)")
+              DST_COUNTS=$(PGPASSWORD="$PGPASSWORD_TARGET" psql \
+                -h "$DST" -U vetuser -d vetdb -XAt \
+                -c "SELECT (SELECT count(*) FROM vets) || ':' || (SELECT count(*) FROM specialties) || ':' || (SELECT count(*) FROM vet_specialties)")
+
+              echo "Source (vets:specialties:vet_specialties): $SRC_COUNTS"
+              echo "Cible  (vets:specialties:vet_specialties): $DST_COUNTS"
+              test "$SRC_COUNTS" = "$DST_COUNTS"

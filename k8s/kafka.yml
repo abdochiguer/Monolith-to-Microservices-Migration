@@ -4,10 +4,38 @@ metadata:
   name: kafka
 
 ---
+# Kafka Connect may read only the sink credentials from this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: debezium-connect-sink-secret
+  namespace: kafka
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["vet-db-sink"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: debezium-connect-sink-secret
+  namespace: kafka
+subjects:
+  - kind: ServiceAccount
+    name: debezium-connect-connect
+    namespace: kafka
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: debezium-connect-sink-secret
+
+---
 # =============================================================================
 # Kafka (mode KRaft, 1 nœud, sans Zookeeper)
 # =============================================================================
-apiVersion: kafka.strimzi.io/v1beta2
+apiVersion: kafka.strimzi.io/v1
 kind: KafkaNodePool
 metadata:
   name: pool
@@ -33,7 +61,7 @@ spec:
     -Xmx: 384m
 
 ---
-apiVersion: kafka.strimzi.io/v1beta2
+apiVersion: kafka.strimzi.io/v1
 kind: Kafka
 metadata:
   name: petclinic-kafka
@@ -43,6 +71,10 @@ metadata:
     strimzi.io/node-pools: enabled
 spec:
   kafka:
+    livenessProbe:
+      initialDelaySeconds: 120
+      timeoutSeconds: 10
+      failureThreshold: 6
     listeners:
       - name: plain
         port: 9092
@@ -70,9 +102,9 @@ spec:
 
 ---
 # =============================================================================
-# KafkaConnect avec le plugin Debezium PostgreSQL (construit automatiquement)
+# KafkaConnect utilisant une image locale construite pour Minikube
 # =============================================================================
-apiVersion: kafka.strimzi.io/v1beta2
+apiVersion: kafka.strimzi.io/v1
 kind: KafkaConnect
 metadata:
   name: debezium-connect
@@ -82,27 +114,26 @@ metadata:
 spec:
   replicas: 1
   bootstrapServers: petclinic-kafka-kafka-bootstrap:9092
-  build:
-    output:
-      type: docker
-      image: localhost:5000/debezium-connect:latest
-    plugins:
-      - name: debezium-postgres
-        artifacts:
-          - type: tgz
-            url: https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.5.4.Final/debezium-connector-postgres-2.5.4.Final-plugin.tar.gz
+  # Build from the repository root before applying: minikube image build -t debezium-connect:3.7.0-cdc1 -f k8s/debezium-connect.Dockerfile .
+  image: debezium-connect:3.7.0-cdc1
+  groupId: debezium-cluster
+  offsetStorageTopic: debezium-offsets
+  configStorageTopic: debezium-configs
+  statusStorageTopic: debezium-statuses
+  livenessProbe:
+    initialDelaySeconds: 180
+    timeoutSeconds: 10
+    failureThreshold: 6
   config:
-    group.id: debezium-cluster
-    offset.storage.topic: debezium-offsets
-    config.storage.topic: debezium-configs
-    status.storage.topic: debezium-statuses
     config.storage.replication.factor: 1
     offset.storage.replication.factor: 1
     status.storage.replication.factor: 1
     key.converter: org.apache.kafka.connect.json.JsonConverter
     value.converter: org.apache.kafka.connect.json.JsonConverter
-    key.converter.schemas.enable: false
-    value.converter.schemas.enable: false
+    key.converter.schemas.enable: true
+    value.converter.schemas.enable: true
+    config.providers: secrets
+    config.providers.secrets.class: io.strimzi.kafka.KubernetesSecretConfigProvider
   resources:
     requests:
       memory: 512Mi
@@ -118,7 +149,7 @@ spec:
 # =============================================================================
 # Connecteur CDC Debezium (déclaratif ! Plus besoin de Job curl)
 # =============================================================================
-apiVersion: kafka.strimzi.io/v1beta2
+apiVersion: kafka.strimzi.io/v1
 kind: KafkaConnector
 metadata:
   name: petclinic-postgres-source
@@ -134,10 +165,80 @@ spec:
     database.user: user
     database.password: pass
     database.dbname: petclinic
-    topic.prefix: petclinic
+    # Topics dédiés, sans snapshot : l'historique est déjà chargé dans vetdb.
+    topic.prefix: petclinic-vet-cdc
     table.include.list: "public.vets,public.specialties,public.vet_specialties"
     plugin.name: pgoutput
     slot.name: debezium_petclinic
     publication.name: debezium_pub
     publication.autocreate.mode: filtered
-    snapshot.mode: initial
+    snapshot.mode: no_data
+
+---
+# =============================================================================
+# Sink CDC : réplique les événements Debezium vers la base Vet
+# =============================================================================
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnector
+metadata:
+  name: vet-vets-sink
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: debezium-connect
+spec:
+  class: io.debezium.connector.jdbc.JdbcSinkConnector
+  tasksMax: 1
+  config:
+    topics: petclinic-vet-cdc.public.vets
+    connection.url: jdbc:postgresql://vet-db.microservices.svc.cluster.local:5432/vetdb
+    connection.username: ${secrets:kafka/vet-db-sink:username}
+    connection.password: ${secrets:kafka/vet-db-sink:password}
+    insert.mode: upsert
+    primary.key.mode: record_key
+    primary.key.fields: id
+    schema.evolution: none
+    table.name.format: vets
+
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnector
+metadata:
+  name: vet-specialties-sink
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: debezium-connect
+spec:
+  class: io.debezium.connector.jdbc.JdbcSinkConnector
+  tasksMax: 1
+  config:
+    topics: petclinic-vet-cdc.public.specialties
+    connection.url: jdbc:postgresql://vet-db.microservices.svc.cluster.local:5432/vetdb
+    connection.username: ${secrets:kafka/vet-db-sink:username}
+    connection.password: ${secrets:kafka/vet-db-sink:password}
+    insert.mode: upsert
+    primary.key.mode: record_key
+    primary.key.fields: id
+    schema.evolution: none
+    table.name.format: specialties
+
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnector
+metadata:
+  name: vet-vet-specialties-sink
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: debezium-connect
+spec:
+  class: io.debezium.connector.jdbc.JdbcSinkConnector
+  tasksMax: 1
+  config:
+    topics: petclinic-vet-cdc.public.vet_specialties
+    connection.url: jdbc:postgresql://vet-db.microservices.svc.cluster.local:5432/vetdb
+    connection.username: ${secrets:kafka/vet-db-sink:username}
+    connection.password: ${secrets:kafka/vet-db-sink:password}
+    insert.mode: upsert
+    primary.key.mode: record_value
+    primary.key.fields: vet_id,specialty_id
+    schema.evolution: none
+    table.name.format: vet_specialties

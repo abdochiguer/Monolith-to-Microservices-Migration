@@ -30,11 +30,13 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
+import org.springframework.web.client.ResourceAccessException;
 
 import java.util.List;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.BDDMockito.then;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -52,6 +54,9 @@ class VetControllerTests {
 
 	@MockitoBean
 	private VetRepository vets;
+
+	@MockitoBean
+	private VetServiceClient vetServiceClient;
 
 	private Vet james() {
 		Vet james = new Vet();
@@ -106,6 +111,38 @@ class VetControllerTests {
 			.andExpect(status().isOk());
 		actions.andExpect(content().contentType(MediaType.APPLICATION_JSON))
 			.andExpect(jsonPath("$.vetList[0].id").value(1));
+
+	}
+
+	@Test
+	void showResourcesVetListUsesVetServiceWhenConfigured() throws Exception {
+		Vet remoteVet = new Vet();
+		remoteVet.setId(3);
+		remoteVet.setFirstName("Remote");
+		remoteVet.setLastName("Vet");
+		given(this.vetServiceClient.isConfigured()).willReturn(true);
+		Vets remoteVets = new Vets();
+		remoteVets.getVetList().add(remoteVet);
+		given(this.vetServiceClient.findAll()).willReturn(remoteVets);
+
+		mockMvc.perform(get("/vets").accept(MediaType.APPLICATION_JSON))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.vetList[0].id").value(3))
+			.andExpect(jsonPath("$.vetList[0].lastName").value("Vet"));
+
+		then(this.vets).shouldHaveNoInteractions();
+	}
+
+	@Test
+	void showResourcesVetListFallsBackToMonolithWhenVetServiceIsUnavailable() throws Exception {
+		given(this.vetServiceClient.isConfigured()).willReturn(true);
+		given(this.vetServiceClient.findAll()).willThrow(new ResourceAccessException("service unavailable"));
+
+		mockMvc.perform(get("/vets").accept(MediaType.APPLICATION_JSON))
+			.andExpect(status().isOk())
+			.andExpect(jsonPath("$.vetList[0].id").value(1));
+
+		then(this.vets).should().findAll();
 	}
 
 }

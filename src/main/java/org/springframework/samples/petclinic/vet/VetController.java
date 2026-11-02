@@ -17,6 +17,8 @@ package org.springframework.samples.petclinic.vet;
 
 import java.util.List;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
@@ -25,6 +27,7 @@ import org.springframework.ui.Model;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseBody;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.servlet.mvc.support.RedirectAttributes;
 
 /**
@@ -36,10 +39,15 @@ import org.springframework.web.servlet.mvc.support.RedirectAttributes;
 @Controller
 class VetController {
 
+	private static final Logger logger = LoggerFactory.getLogger(VetController.class);
+
 	private final VetRepository vetRepository;
 
-	public VetController(VetRepository vetRepository) {
+	private final VetServiceClient vetServiceClient;
+
+	public VetController(VetRepository vetRepository, VetServiceClient vetServiceClient) {
 		this.vetRepository = vetRepository;
+		this.vetServiceClient = vetServiceClient;
 	}
 
 	@GetMapping("/vets.html")
@@ -71,6 +79,14 @@ class VetController {
 
 	@GetMapping({ "/vets" })
 	public @ResponseBody Vets showResourcesVetList() {
+		if (this.vetServiceClient.isConfigured()) {
+			try {
+				return this.vetServiceClient.findAll();
+			}
+			catch (RestClientException ex) {
+				logger.warn("Vet service request failed; serving veterinarians from the monolith", ex);
+			}
+		}
 		// Here we are returning an object of type 'Vets' rather than a collection of Vet
 		// objects so it is simpler for JSon/Object mapping
 		Vets vets = new Vets();

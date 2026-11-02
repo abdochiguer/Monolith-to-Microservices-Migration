@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: petclinic-canary
+  namespace: default
+spec:
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  selector:
+    app: petclinic-canary
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: petclinic-canary
+  namespace: default
+  labels:
+    app: petclinic-canary
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: petclinic-canary
+  template:
+    metadata:
+      labels:
+        app: petclinic-canary
+    spec:
+      containers:
+        - name: workload
+          image: petclinic:canary-cdc2
+          imagePullPolicy: Never
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: postgres
+            - name: POSTGRES_URL
+              value: jdbc:postgresql://demo-db:5432/petclinic
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: demo-db
+                  key: username
+            - name: POSTGRES_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: demo-db
+                  key: password
+            - name: JAVA_TOOL_OPTIONS
+              value: -XX:MaxRAMPercentage=65.0
+            - name: SPRING_APPLICATION_JSON
+              value: |
+                {
+                  "management.endpoint.health.probes.add-additional-paths": true,
+                  "petclinic.services.vet.base-url": "http://vet-service.microservices.svc.cluster.local:8080",
+                  "petclinic.services.vet.connect-timeout": "2s",
+                  "petclinic.services.vet.read-timeout": "15s"
+                }
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            failureThreshold: 60
+            periodSeconds: 10
+            timeoutSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            timeoutSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            timeoutSeconds: 10

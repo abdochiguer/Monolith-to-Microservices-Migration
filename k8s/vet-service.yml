@@ -12,6 +12,20 @@ stringData:
 
 ---
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vet-db-data
+  namespace: microservices
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi
+
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: vet-db-init
@@ -60,6 +74,8 @@ metadata:
     app: vet-db
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: vet-db
@@ -100,7 +116,8 @@ spec:
           configMap:
             name: vet-db-init
         - name: vet-db-data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: vet-db-data
 
 ---
 apiVersion: v1
