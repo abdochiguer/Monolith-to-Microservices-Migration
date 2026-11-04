@@ -20,6 +20,7 @@ import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Controller;
@@ -74,6 +75,18 @@ class VetController {
 		int pageSize = 5;
 		int safePage = Math.max(page, 1);
 		Pageable pageable = PageRequest.of(safePage - 1, pageSize);
+		if (this.vetServiceClient.isConfigured()) {
+			try {
+				List<Vet> vets = this.vetServiceClient.findAll().getVetList();
+				int start = (int) pageable.getOffset();
+				int end = Math.min(start + pageSize, vets.size());
+				List<Vet> content = start < end ? vets.subList(start, end) : List.of();
+				return new PageImpl<>(content, pageable, vets.size());
+			}
+			catch (RestClientException ex) {
+				logger.warn("Vet service request failed; serving veterinarians from the monolith", ex);
+			}
+		}
 		return vetRepository.findAll(pageable);
 	}
 

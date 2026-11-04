@@ -12,21 +12,9 @@ data:
         server petclinic.default.svc.cluster.local:80 max_fails=3 fail_timeout=10s;
       }
 
-      upstream canary_monolith_backend {
-        server petclinic-canary.default.svc.cluster.local:80 max_fails=1 fail_timeout=5s;
+      upstream vet_service_backend {
+        server vet-service.microservices.svc.cluster.local:8080 max_fails=3 fail_timeout=10s;
         server petclinic.default.svc.cluster.local:80 backup;
-      }
-
-      # Le trafic reste sur le monolithe stable sauf activation explicite du canary.
-      split_clients "${request_id}" $canary_upstream {
-        100%    monolith_backend;
-      }
-
-      # Priorité au header X-Canary pour les tests internes sans impacter les utilisateurs réels
-      map $http_x_canary $chosen_vet_upstream {
-        "true"  canary_monolith_backend;
-        "false" monolith_backend;
-        default $canary_upstream;
       }
 
       server {
@@ -37,8 +25,8 @@ data:
           add_header Content-Type text/plain;
         }
 
-        # Route Strangler Fig pour le domaine des vétérinaires
-        location /vets {
+        # Route the Vet API to the service; keep /vets.html on the monolith.
+        location ~ ^/vets(/|$) {
           proxy_set_header Host $http_host;
           proxy_set_header X-Real-IP $remote_addr;
           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -51,7 +39,7 @@ data:
 
           # Sécurité Zero-Downtime : Si le microservice échoue (502, 503, 504), bascule transparente vers le monolithe
           proxy_next_upstream error timeout http_502 http_503 http_504;
-          proxy_pass http://$chosen_vet_upstream;
+          proxy_pass http://vet_service_backend;
           proxy_redirect off;
         }
 

@@ -27,6 +27,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.aot.DisabledInAotMode;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders;
@@ -34,6 +35,7 @@ import org.springframework.web.client.ResourceAccessException;
 
 import java.util.List;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
@@ -94,6 +96,39 @@ class VetControllerTests {
 			.andExpect(model().attributeExists("listVets"))
 			.andExpect(view().name("vets/vetList"));
 
+	}
+
+	@Test
+	void showVetListHtmlUsesVetServiceWhenConfigured() throws Exception {
+		Vet remoteVet = new Vet();
+		remoteVet.setId(3);
+		remoteVet.setFirstName("Remote");
+		remoteVet.setLastName("Vet");
+		given(this.vetServiceClient.isConfigured()).willReturn(true);
+		Vets remoteVets = new Vets();
+		remoteVets.getVetList().add(remoteVet);
+		given(this.vetServiceClient.findAll()).willReturn(remoteVets);
+
+		MvcResult result = mockMvc.perform(get("/vets.html?page=1"))
+			.andExpect(status().isOk())
+			.andExpect(view().name("vets/vetList"))
+			.andReturn();
+
+		assertThat(result.getModelAndView().getModel().get("listVets")).isEqualTo(List.of(remoteVet));
+		then(this.vets).shouldHaveNoInteractions();
+	}
+
+	@Test
+	void showVetListHtmlFallsBackToMonolithWhenVetServiceIsUnavailable() throws Exception {
+		given(this.vetServiceClient.isConfigured()).willReturn(true);
+		given(this.vetServiceClient.findAll()).willThrow(new ResourceAccessException("service unavailable"));
+
+		MvcResult result = mockMvc.perform(get("/vets.html?page=1"))
+			.andExpect(status().isOk())
+			.andReturn();
+
+		assertThat(result.getModelAndView().getModel().get("listVets")).asList().hasSize(2);
+		then(this.vets).should().findAll(any(Pageable.class));
 	}
 
 	@Test

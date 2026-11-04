@@ -40,4 +40,8 @@ public class Vets {
 		return vets;
 	}
 
+	public void setVetList(List<Vet> vets) {
+		this.vets = vets;
+	}
+
 }
