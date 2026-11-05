@@ -1,448 +1,611 @@
-# Déconstruction et Migration d'un Monolithe : Architecture Strangler Fig, CDC et Kubernetes de Bout en Bout
-
-> **Auteur / Dossier Technique d'Architecture Système**  
-> Ce document est conçu comme un article technique approfondi décrivant de manière exhaustive la méthodologie, l'architecture d'infrastructure, le découpage des données, la gestion des flux en temps réel et les procédures d'exploitation mises en œuvre pour migrer un système monolithique vers une architecture microservices sans aucune coupure de service (**Zero Downtime**).
-
+---
+> **Dernière mise à jour :** Novembre 2026
+>
+> **Domaine :** Cloud-Native Architecture, Kubernetes, Event-Driven Systems & Data Engineering
 ---
 
-## Sommaire Analytique
-1. [Introduction & Genèse du Projet](#1-introduction--genèse-du-projet)
-2. [Analyse de l'État Initial & Problématique Métier](#2-analyse-de-létat-initial--problématique-métier)
-3. [La Stratégie Directrice : Le Strangler Fig Pattern](#3-la-stratégie-directrice--le-strangler-fig-pattern)
-4. [Architecture Réseau & Isolation sous Kubernetes](#4-architecture-réseau--isolation-sous-kubernetes)
-5. [L'API Gateway (Nginx) : Le Cœur de l'Aiguillage et de la Haute Disponibilité](#5-lapi-gateway-nginx--le-cœur-de-laiguillage-et-de-la-haute-disponibilité)
-6. [La Séparation des Données : Database-per-Service](#6-la-séparation-des-données--database-per-service)
-7. [Phase 1 de Migration : Le Chargement des Données Historiques (Batch One-Shot)](#7-phase-1-de-migration--le-chargement-des-données-historiques-batch-one-shot)
-8. [Phase 2 de Migration : Synchronisation Continue via CDC (Change Data Capture) & Apache Kafka](#8-phase-2-de-migration--synchronisation-continue-via-cdc-change-data-capture--apache-kafka)
-9. [Analyse des Incidents Réels, Contraintes Opérationnelles & Optimisations](#9-analyse-des-incidents-réels-contraintes-opérationnelles--optimisations)
-10. [Guide d'Exploitation et Déploiement Reproductible](#10-guide-dexploitation-et-déploiement-reproductible)
-11. [Conclusion & Synthèse Comparative](#11-conclusion--synthèse-comparative)
+# Zero-Downtime Monolith-to-Microservices Migration Factory
+### Strangler Fig Pattern, CDC (Debezium / Apache Kafka) & Fallback Resilient Routing under Kubernetes
 
----
+Ce projet implémente une **stratégie industrielle complète de décomposition et de migration d'un système monolithique vers une architecture microservices distribuée** sous Kubernetes, garantissant une continuité absolue d'activité (**Zero Downtime**), l'intégrité transactionnelle des données historiques et la réplication événementielle en temps réel via **Change Data Capture (CDC)**.
 
-## 1. Introduction & Genèse du Projet
+> [!NOTE]
+> Conçu et documenté pour fournir un standard d'ingénierie réutilisable permettant de découper n'importe quel monolithe d'entreprise sans interruption de production ni risque de désynchronisation.
 
-La modernisation d'un système d'information critique fait face à une contrainte forte : **le système ne peut pas s'arrêter**. La réécriture intégrale (*Big Bang*) est le modèle qui présente le taux d'échec le plus élevé en ingénierie logicielle. Elle crée un "effet tunnel" où le produit reste figé pendant des mois, avant une bascule massive le week-end qui s'achève fréquemment en indisponibilité majeure ou en perte de données.
+<div align="center">
 
-Ce projet prouve et met en œuvre une alternative industrielle : **la décomposition incrémentale**.
-En prenant pour socle un système monolithique d'entreprise (gestion de clinique vétérinaire), nous avons extrait un domaine fonctionnel autonome — **les Vétérinaires (`vets`)** — pour le propulser sous forme de microservice indépendant (`vet-service`), tout en maintenant la coexistence harmonieuse et transparente de l'ancien et du nouveau système.
-
----
-
-## 2. Analyse de l'État Initial & Problématique Métier
-
-### Le Système Legacy
-Initialement, l'ensemble des modules (propriétaires `owners`, animaux `pets`, visites médicales `visits`, et vétérinaires `vets`) réside au sein du même exécutable. 
-Toutes les entités sont regroupées dans un schéma relationnel unique géré par une base PostgreSQL (`demo-db`).
-
-```mermaid
-graph TD
-    subgraph Monolithe Initial
-        M[Application Monolithique]
-        DB[(PostgreSQL Unique : demo-db)]
-        M -->|Lecture / Écriture| DB
-    end
-    DB --- T1[Table: owners]
-    DB --- T2[Table: pets]
-    DB --- T3[Table: visits]
-    DB --- T4[Table: vets & specialties]
+```
+==================================================================================================
+        MIGRATION FACTORY : STRANGLER FIG + CHANGE DATA CAPTURE + K8S SMART GATEWAY
+==================================================================================================
+  [Clients / HTTP] ---> [ Nginx API Gateway ]
+                              |
+            +-----------------+-----------------+
+            | (Route /vets)                     | (Toutes les autres routes + Fallback 502/503)
+            v                                   v
+    [ vet-service (Pod) ]               [ petclinic (Monolithe Legacy) ]
+            |                                   |
+            v                                   v
+    [( vet-db PostgreSQL )]             [( demo-db PostgreSQL : WAL Logical )]
+            ^                                   |
+            |       +-----------------------+   |
+            +-------| Kafka JDBC Sink       |<--+ (Capture continue des deltas via Debezium)
+                    | & Apache Kafka Broker |
+                    +-----------------------+
+==================================================================================================
 ```
 
-### Les Problèmes du Modèle Initial
-1. **Couplage Fort** : Toute modification du modèle relationnel de la table `vets` exigeait de reconstruire et redéployer l'intégralité du monolithe.
-2. **Concurrence sur les Ressources** : Une requête complexe de reporting sur les vétérinaires pouvait saturer le pool de connexions et bloquer la prise de rendez-vous pour les visites.
-3. **Impossibilité de scaler sélectivement** : Impossible d'allouer plus de CPU au module le plus sollicité sans démultiplier l'intégralité du monolithe.
+</div>
 
 ---
 
-## 3. La Stratégie Directrice : Le Strangler Fig Pattern
+## Table des Matières
 
-Pour transformer ce monolithe sans interruption, nous avons déployé le patron d'architecture **Strangler Fig** (Figuier Étrangleur).
+### [Section I : Vision d'Architecture Globale & Stratégie de Découplage](#section-1--vision-darchitecture-globale--stratégie-de-découplage)
+- [Problématique Industrielle & Le Piège du "Big Bang"](#problématique-industrielle--le-piège-du-big-bang)
+- [Le Strangler Fig Pattern (Figuier Étrangleur)](#le-strangler-fig-pattern-figuier-étrangleur)
+- [Architecture Haute Disponibilité sous Kubernetes](#architecture-haute-disponibilité-sous-kubernetes)
+- [Principes Directeurs d'Ingénierie](#principes-directeurs-dingénierie)
+
+### [Section II : Découpage Réseau & Compartimentation Kubernetes](#section-2--découpage-réseau--compartimentation-kubernetes)
+- [Topologie des Espaces de Noms (Namespaces)](#topologie-des-espaces-de-noms-namespaces)
+- [L'API Gateway (Nginx) : Le Cœur de l'Aiguillage](#lapi-gateway-nginx--le-cœur-de-laiguillage)
+  - [Découpage Granulaire des Chemins d'Accès](#découpage-granulaire-des-chemins-daccès)
+  - [Sécurité Active & Fallback Transparent (Zero-Downtime)](#sécurité-active--fallback-transparent-zero-downtime)
+  - [Traçabilité Distribuée & Métriques](#traçabilité-distribuée--métriques)
+
+### [Section III : Architecture des Données & Pipeline de Synchronisation](#section-3--architecture-des-données--pipeline-de-synchronisation)
+- [Le Modèle Database-per-Service](#le-modèle-database-per-service)
+- [Phase 1 : Migration des Données Historiques (Job One-Shot)](#phase-1--migration-des-données-historiques-job-one-shot)
+  - [Extraction Atomique & Résolution des Incompatibilités PG18 / PG16](#extraction-atomique--résolution-des-incompatibilités-pg18--pg16)
+  - [Contrôle d'Intégrité Strict & Assertions](#contrôle-dintégrité-strict--assertions)
+- [Phase 2 : Synchronisation Continue via CDC & Apache Kafka](#phase-2--synchronisation-continue-via-cdc--apache-kafka)
+  - [L'Antipattern du Dual-Write & Décodage Logique du WAL](#lantipattern-du-dual-write--décodage-logique-du-wal)
+  - [Cluster Kafka KRaft & Opérateur Strimzi](#cluster-kafka-kraft--opérateur-strimzi)
+  - [Image Dérivée Kafka Connect & Connecteurs Déclaratifs](#image-dérivée-kafka-connect--connecteurs-déclaratifs)
+  - [Connecteur Debezium Source (PostgreSQL)](#connecteur-debezium-source-postgresql)
+  - [Connecteur Debezium JDBC Sink & Idempotence par Upsert](#connecteur-debezium-jdbc-sink--idempotence-par-upsert)
+
+### [Section IV : Incidents Opérationnels Résolus & Retours d'Expérience](#section-4--incidents-opérationnels-résolus--retours-dexpérience)
+- [Résolution des CrashLoopBackOff & Dimensionnement JVM](#résolution-des-crashloopbackoff--dimensionnement-jvm)
+- [Découplage de Snapshot (snapshot.mode: no_data)](#découplage-de-snapshot-snapshotmode-no_data)
+- [Gestion Déclarative des Secrets RBAC](#gestion-déclarative-des-secrets-rbac)
+
+### [Section V : Guide d'Exploitation & Déploiement Reproductible](#section-5--guide-dexploitation--déploiement-reproductible)
+- [Matrice des Dépendances & Prérequis](#matrice-des-dépendances--prérequis)
+- [Déploiement Séquentiel Pas à Pas](#déploiement-séquentiel-pas-à-pas)
+- [Validation & Cahier de Recette Postman](#validation--cahier-de-recette-postman)
+
+---
+
+# Section 1 : Vision d'Architecture Globale & Stratégie de Découplage
+
+## Problématique Industrielle & Le Piège du "Big Bang"
+
+Dans les architectures logicielles traditionnelles, le **Monolithe** centralise la totalité du code métier au sein d'un seul exécutable et s'appuie sur une unique base de données relationnelle. 
+
+```mermaid
+graph LR
+    subgraph Approche Déconseillée : Le Big Bang
+        Old[Monolithe Historique] -. Interruption de Service .-> Tunnel[6 à 12 Mois d'Effet Tunnel]
+        Tunnel -. Bascule Unique 100% .-> Risk[Risque Critique : Bugs, Pertes de Données, Rollback Impossible]
+    end
+```
+
+L'approche naïve consistant à réécrire l'ensemble du système en parallèle avant une bascule globale (*Big Bang*) présente des risques critiques :
+1. **L'Effet Tunnel** : Gel des fonctionnalités métier pendant des mois durant le cycle de réécriture.
+2. **La Rupture Transactionnelle** : Le jour de la bascule, des centaines de régressions imprévues surviennent simultanément.
+3. **L'Indisponibilité Imposée** : Nécessité d'une coupure de service prolongée pour migrer les téraoctets de données.
+
+---
+
+## Le Strangler Fig Pattern (Figuier Étrangleur)
+
+Inspiré du figuier étrangleur qui grandit autour d'un arbre hôte jusqu'à le remplacer progressivement, ce patron permet de démanteler le monolithe **service par service**, de manière totalement imperceptible pour l'utilisateur.
 
 ```mermaid
 flowchart TD
-    subgraph Étape 1 : Interception
-        Client1[Clients HTTP] --> Proxy[API Gateway / Nginx]
-        Proxy -->|100% du trafic| Mono1[Monolithe Legacy]
+    subgraph 1. État Initial
+        C1[Clients Web & Mobile] --> M1[Monolithe Unique 100%]
     end
 
-    subgraph Étape 2 : Coexistence & Extraction
-        Client2[Clients HTTP] --> Proxy2[API Gateway / Nginx]
-        Proxy2 -->|Trafic Standard & Pages HTML| Mono2[Monolithe Legacy]
-        Proxy2 -->|API JSON /vets| MS[Microservice: vet-service]
-        Mono2 -.->|Réplication Asynchrone CDC| MS
+    subgraph 2. Coexistence Strangler Fig
+        C2[Clients Web & Mobile] --> GW[API Gateway / Nginx]
+        GW -->|Toutes routes + Rendu HTML| M2[Monolithe Legacy]
+        GW -->|API REST /vets| MS[Nouveau Microservice: vet-service]
+        M2 -.->|Capture CDC & Kafka| MS
     end
 
-    subgraph Étape 3 : Décommissionnement
-        Client3[Clients HTTP] --> Proxy3[API Gateway]
-        Proxy3 --> MS_Vets[Microservice Vets]
-        Proxy3 --> MS_Others[Autres Microservices...]
+    subgraph 3. État Cible Final
+        C3[Clients Web & Mobile] --> GW2[API Gateway]
+        GW2 --> MS_Vets[Microservice Vets]
+        GW2 --> MS_Visits[Microservice Visits]
+        GW2 --> MS_Owners[Microservice Owners]
     end
 ```
 
-### Les Trois Piliers du Strangler Fig :
-1. **Intercepter** : Aucune requête client ne doit atteindre directement le backend ; tout passe par une passerelle (API Gateway).
-2. **Transformer** : Le domaine isolé est redéveloppé sous forme de service autonome, avec sa propre base de données.
-3. **Basculer & Étrangler** : La passerelle réoriente graduellement les requêtes vers le microservice. Lorsque plus aucune requête ne sollicite l'ancien code du domaine dans le monolithe, ce dernier peut être purgé ou désactivé.
+### Le Cycle de Vie d'Extraction d'un Domaine :
+- **Identifier** : Extraire un domaine métier aux frontières claires (*Bounded Context* : gestion des vétérinaires).
+- **Intercepter** : Déployer une API Gateway qui prend en charge l'ensemble des requêtes entrantes.
+- **Réfracter les Données** : Créer une base dédiée (*Database-per-Service*) et initialiser son stock de données.
+- **Synchroniser** : Écouter passivement les modifications résiduelles de l'ancien système grâce au **Change Data Capture (CDC)**.
+- **Aiguiller & Sécuriser** : Rediriger la route HTTP vers le microservice avec un **fallback transparent** vers le monolithe en cas d'erreur.
 
 ---
 
-## 4. Architecture Réseau & Isolation sous Kubernetes
+## Architecture Haute Disponibilité sous Kubernetes
 
-L'infrastructure cible repose sur **Kubernetes**, architecturée en **Namespaces** étanches afin d'appliquer le principe de séparation des privilèges et de compartimentation réseau :
+L'ensemble de l'infrastructure est déployé de façon déclarative sur Kubernetes :
 
 ```mermaid
 graph TB
-    Internet([Trafic Entrant Externe]) --> Ingress[K8s Ingress Controller]
+    Client([Clients HTTP / Navigateurs]) --> Ingress[Kubernetes Ingress Controller]
 
-    subgraph "Namespace: gateway"
-        Ingress --> GatewaySvc[Service: gateway]
-        GatewaySvc --> NginxPod[Pod: Nginx Reverse-Proxy]
+    subgraph "Namespace gateway (Point d'Entrée Unique)"
+        Ingress --> GatewayService[Service: gateway :80]
+        GatewayService --> GatewayPod[Pod: Nginx Reverse-Proxy :8080]
     end
 
-    subgraph "Namespace: default (Legacy)"
-        MonolithPod[Pod: petclinic monolith]
-        DemoDBPod[(Pod: demo-db PostgreSQL)]
-        MonolithPod --> DemoDBPod
+    subgraph "Namespace microservices (Nouveau Monde)"
+        VetService[Pod: vet-service :8080]
+        VetDB[(Pod: vet-db PostgreSQL 16)]
+        VetService --> VetDB
     end
 
-    subgraph "Namespace: microservices"
-        VetSvcPod[Pod: vet-service]
-        VetDBPod[(Pod: vet-db PostgreSQL)]
-        VetSvcPod --> VetDBPod
+    subgraph "Namespace default (Monolithe & Source)"
+        MonolithPod[Pod: petclinic monolith :8080]
+        DemoDB[(Pod: demo-db PostgreSQL 18 : WAL Logical)]
+        MonolithPod --> DemoDB
     end
 
-    subgraph "Namespace: kafka (Data Streaming)"
-        KafkaBroker[(Pod: petclinic-kafka KRaft)]
+    subgraph "Namespace kafka (Data Streaming & CDC)"
+        KafkaBroker[(Pod: petclinic-kafka KRaft :9092)]
         ConnectPod[Pod: debezium-connect]
+        ConnectPod <--> KafkaBroker
     end
 
-    %% Flux Réseau Inter-Namespaces
-    NginxPod -->|Routage /vets| VetSvcPod
-    NginxPod -->|Routage / et Fallback| MonolithPod
-    ConnectPod -.->|Capture WAL| DemoDBPod
-    ConnectPod -.->|Upsert Events| VetDBPod
-    ConnectPod <--> KafkaBroker
-```
+    subgraph "Orchestration Ponctuelle"
+        MigrationJob[Job K8s: migrate-historical-vets]
+    end
 
-### Rôle des Namespaces :
-- **`gateway`** : Héberge Nginx, les ConfigMaps de routage et l'Ingress. C'est la zone démilitarisée (DMZ) interne du cluster.
-- **`default`** : Isole le monolithe historique et sa base source `demo-db`.
-- **`microservices`** : Environnement d'accueil des nouveaux microservices autonomes et de leurs bases de données dédiées.
-- **`kafka`** : Espace réservé à l'infrastructure de streaming d'événements, aux opérateurs Strimzi et aux connecteurs Kafka Connect.
+    %% Flux de Routage Réseau
+    GatewayPod -->|1. Route API /vets| VetService
+    GatewayPod -->|2. Route par défaut / & HTML| MonolithPod
+    GatewayPod -.->|3. Fallback immédiat si 502/503| MonolithPod
+
+    %% Flux de Données
+    MigrationJob -. 1. Extraction One-Shot .-> DemoDB
+    MigrationJob -. 2. Injection Atomique .-> VetDB
+    ConnectPod -. Capture WAL continue .-> DemoDB
+    ConnectPod -. Upsert en streaming .-> VetDB
+```
 
 ---
 
-## 5. L'API Gateway (Nginx) : Le Cœur de l'Aiguillage et de la Haute Disponibilité
+## Principes Directeurs d'Ingénierie
 
-La passerelle Nginx joue le rôle de pivot. Elle réalise un travail d'aiguillage contextuel tout en intégrant un filet de sécurité transparent.
+1. **Zero-Downtime Absolu** : Aucune étape de migration ne nécessite l'arrêt de la production.
+2. **Zéro Modification de Code Legacy** : Le monolithe continue de fonctionner sans altération de son code source grâce au CDC passif.
+3. **Idempotence de Réplication** : Toute opération de données rejouée plusieurs fois produit le même résultat final sans corruption.
+4. **Cloisonnement Strict** : Séparation réseau et sécuritaire par Namespaces Kubernetes et permissions RBAC.
 
-### 5.1. Découpage Granulaire des Chemins d'Accès
+---
 
-Le défi classique d'une application web réside dans la séparation entre l'interface utilisateur et les interfaces de programmation :
-- **L'API de données** (`GET /vets`) est consommée par des composants modernes ou des applications clientes : elle doit être dirigée vers `vet-service`.
-- **L'interface graphique rendue côté serveur** (`GET /vets.html`) est basée sur les templates Thymeleaf du monolithe. Si l'on envoyait `/vets.html` au microservice, celui-ci renverrait une erreur 404 car il n'embarque pas les vues web legacy.
+# Section 2 : Découpage Réseau & Compartimentation Kubernetes
 
-**Configuration Nginx appliquée ([k8s/gateway.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/gateway.yml)) :**
-```nginx
-# Upstream principal du microservice avec le monolithe déclaré en secours immédiat
-upstream vet_service_backend {
-    server vet-service.microservices.svc.cluster.local:8080 max_fails=3 fail_timeout=10s;
-    server petclinic.default.svc.cluster.local:80 backup;
-}
+## Topologie des Espaces de Noms (Namespaces)
 
-upstream monolith_backend {
-    server petclinic.default.svc.cluster.local:80 max_fails=3 fail_timeout=10s;
-}
+Pour assurer une isolation stricte des responsabilités et des privilèges réseau, le cluster est découpé en 4 espaces de noms étanches ([k8s/00-namespaces.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/00-namespaces.yml)) :
 
-# Aiguille l'API REST vers le microservice
-location ~ ^/vets(/|$) {
-    proxy_set_header Host $http_host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Request-ID $request_id;
+| Namespace | Périmètre Opérationnel | Composants Déployés |
+| :--- | :--- | :--- |
+| **`gateway`** | Zone démilitarisée (DMZ), routage et résilience | Nginx Reverse-Proxy, ConfigMaps de routage, Ingress K8s |
+| **`default`** | Environnement legacy / monolithe | Application Spring PetClinic, Base source `demo-db` (Postgres 18) |
+| **`microservices`** | Nouveaux services distribués autonomes | Microservice `vet-service`, Base dédiée `vet-db` (Postgres 16), Secrets |
+| **`kafka`** | Infrastructure de streaming événementiel | Cluster Kafka KRaft, Debezium Connect, KafkaConnector CRDs, Secrets Sink |
+
+---
+
+## L'API Gateway (Nginx) : Le Cœur de l'Aiguillage
+
+L'API Gateway constitue le **point focal** de la migration. Elle isole les clients externes de la topologie interne du cluster.
+
+```mermaid
+flowchart TD
+    Req[Requête Entrante : GET /vets] --> GW[Nginx Gateway]
     
-    # Sécurité Zero-Downtime : Si le microservice échoue, bascule instantanée sur le backup
-    proxy_next_upstream error timeout http_502 http_503 http_504;
-    proxy_pass http://vet_service_backend;
-}
+    GW -->|Tentative Primaire| MS[vet-service.microservices:8080]
+    MS -- 200 OK --> GW
+    
+    MS -.->|Crash / 502 / 503 / Timeout| ErrorTrigger{Erreur Détectée ?}
+    ErrorTrigger -->|Oui : proxy_next_upstream| Backup[Monolithe Legacy : Backup]
+    Backup -- 200 OK --> GW
+    
+    GW --> Res[Réponse Garantie au Client Sans Coupure]
+```
 
-# Reste du trafic (y compris /vets.html et /owners) vers le monolithe
-location / {
-    proxy_pass http://monolith_backend;
+### Découpage Granulaire des Chemins d'Accès
+
+Dans une application web mixte (APIs REST + pages HTML générées côté serveur par Thymeleaf) :
+- La route d'API de données **`GET /vets`** (format JSON) est transmise au nouveau microservice.
+- La route web **`GET /vets.html`** (générée par le moteur de rendu du monolithe) doit impérativement rester sur le monolithe.
+
+Extrait de la configuration Nginx ([k8s/gateway.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/gateway.yml)) :
+
+```nginx
+events {}
+
+http {
+  upstream monolith_backend {
+    server petclinic.default.svc.cluster.local:80 max_fails=3 fail_timeout=10s;
+  }
+
+  upstream vet_service_backend {
+    server vet-service.microservices.svc.cluster.local:8080 max_fails=3 fail_timeout=10s;
+    server petclinic.default.svc.cluster.local:80 backup; # <-- Cœur du Fallback
+  }
+
+  server {
+    listen 8080;
+
+    location = /healthz {
+      return 200 'ok';
+      add_header Content-Type text/plain;
+    }
+
+    # Route l'API REST vers le microservice tout en conservant /vets.html sur le monolithe
+    location ~ ^/vets(/|$) {
+      proxy_set_header Host $http_host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Request-ID $request_id;
+      proxy_connect_timeout 10s;
+      proxy_read_timeout 30s;
+
+      # Sécurité Zero-Downtime : Bascule instantanée vers le monolithe en cas de défaillance
+      proxy_next_upstream error timeout http_502 http_503 http_504;
+      proxy_pass http://vet_service_backend;
+      proxy_redirect off;
+    }
+
+    # Reste de l'application envoyé vers le monolithe
+    location / {
+      proxy_set_header Host $http_host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Request-ID $request_id;
+      proxy_pass http://monolith_backend;
+    }
+  }
 }
 ```
 
-### 5.2. Le Mécanisme de Fallback Transparent (Zero-Downtime)
+### Sécurité Active & Fallback Transparent (Zero-Downtime)
 
-La directive `server petclinic.default.svc.cluster.local:80 backup;` associée à `proxy_next_upstream` constitue la clé de voûte de la continuité d'activité :
-1. Un client émet `GET /vets`.
-2. Nginx initie la connexion vers `vet-service`.
-3. Si le pod du microservice crash (`OOMKilled`, redémarrage, saturation ou timeout réseau) :
-   - Nginx intercepte le code d'erreur HTTP 502/503/504 en interne (dans les limites du `proxy_connect_timeout`).
-   - Nginx rejoue la requête **exactement identique** sur le serveur déclaré en `backup` (le monolithe).
-   - Le client reçoit sa réponse 200 sans jamais constater de panne.
+La directive `server petclinic.default.svc.cluster.local:80 backup;` permet d'annihiler tout risque lié à la mise en production du microservice :
+- Si `vet-service` subit un incident (redémarrage, OOMKilled, saturation mémoire), Nginx intercepte le code `502 Bad Gateway` ou `503 Service Unavailable`.
+- En moins de quelques millisecondes, la requête est rejouée sur le monolithe historique sans renvoyer d'erreur au client final.
+
+### Traçabilité Distribuée & Métriques
+Chaque paquet transitant par la Gateway se voit attribuer un identifiant unique via `$request_id` injecté dans l'en-tête `X-Request-ID`, garantissant la traçabilité de bout en bout des requêtes dans les logs applicatifs.
 
 ---
 
-## 6. La Séparation des Données : Database-per-Service
+# Section 3 : Architecture des Données & Pipeline de Synchronisation
 
-Partager une base de données entre plusieurs microservices est l'erreur d'architecture la plus fréquente. Elle crée un couplage caché par le schéma et détruit l'autonomie des équipes.
+## Le Modèle Database-per-Service
+
+Un microservice ne doit **jamais** partager sa base de données avec un autre composant. 
 
 ```mermaid
 classDiagram
-    class DemoDB_Legacy {
-        +vets
-        +specialties
-        +vet_specialties
-        +owners
-        +pets
-        +visits
+    class Legacy_demo_db {
+        +table: owners
+        +table: pets
+        +table: visits
+        +table: vets
+        +table: specialties
+        +table: vet_specialties
     }
-    class VetDB_Microservice {
-        +vets (id, first_name, last_name)
-        +specialties (id, name)
-        +vet_specialties (vet_id, specialty_id)
+    class Microservice_vet_db {
+        +table: vets
+        +table: specialties
+        +table: vet_specialties
     }
-    DemoDB_Legacy ..> VetDB_Microservice : Découplage strict
+    Legacy_demo_db ..> Microservice_vet_db : Découplage strict du stockage
 ```
 
-### Déploiement de la Base Cible `vet-db`
-Dans [k8s/vet-service.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/vet-service.yml) :
-- **Moteur** : PostgreSQL 16 Alpine.
-- **Isolation** : Un PersistentVolumeClaim dédié (`vet-db-data`) de 2Gi indépendant du stockage legacy.
-- **Initialisation Déclarative** : Un `ConfigMap` contenant le DDL SQL strict du domaine (`01-init.sql`) monté dans `/docker-entrypoint-initdb.d` pour créer les tables et index `idx_vets_last_name` et `idx_specialties_name`.
+Pour le domaine extrait :
+- Déploiement d'une instance PostgreSQL 16 dédiée (`vet-db`).
+- Allocation d'un stockage persistant indépendant via un PersistentVolumeClaim (`vet-db-data`).
+- Schéma DDL autonome instancié via `ConfigMap` déclaratif ([k8s/vet-service.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/vet-service.yml)).
 
 ---
 
-## 7. Phase 1 de Migration : Le Chargement des Données Historiques (Batch One-Shot)
+## Phase 1 : Migration des Données Historiques (Job One-Shot)
 
-Avant d'activer le flux temps réel, il est obligatoire d'importer le stock initial de données présent dans `demo-db` vers `vet-db`.
+La base `vet-db` démarrant vide, un job Kubernetes batch one-shot (`migrate-historical-vets`) assure le transfert initial sans interruption du trafic ([k8s/migrate-historical-data-job.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/migrate-historical-data-job.yml)).
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant K8s as Orchestrateur Kubernetes
+    participant K8s as Orchestrateur K8s
     participant Job as Job: migrate-historical-vets
     participant Src as demo-db (default)
     participant Dst as vet-db (microservices)
 
-    K8s->>Job: Déclenchement du Pod de migration
-    Job->>Src: pg_dump --data-only --inserts -t vets,specialties,vet_specialties
+    K8s->>Job: Lancement du Pod
+    Job->>Src: pg_dump --data-only --inserts -t vets -t specialties -t vet_specialties
     Src-->>Job: Flux SQL brut
-    Job->>Job: Nettoyage des directives incompatibles (sed transaction_timeout)
+    Job->>Job: Nettoyage sed (Suppression SET transaction_timeout)
     Job->>Dst: psql --single-transaction (TRUNCATE + INSERT)
     Dst-->>Job: Commit validé
-    Job->>Src: SELECT count(*) vets, specialties, vet_specialties
-    Job->>Dst: SELECT count(*) vets, specialties, vet_specialties
-    Job->>Job: Assertion : Source Count == Target Count ?
-    alt Succès
-        Job->>K8s: Exit Code 0 (Completed)
+    Job->>Src: SELECT count(*) (vets, specialties, vet_specialties)
+    Job->>Dst: SELECT count(*) (vets, specialties, vet_specialties)
+    Job->>Job: Assertion stricte : $SRC_COUNTS == $DST_COUNTS
+    alt Parité Validée
+        Job->>K8s: Status: Completed (Exit 0)
     else Échec
-        Job->>K8s: Exit Code 1 (Erreur bloquante)
+        Job->>K8s: Status: Error (Exit 1)
     end
 ```
 
-### Implémentation du Job Kubernetes ([k8s/migrate-historical-data-job.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/migrate-historical-data-job.yml))
+### Extraction Atomique & Résolution des Incompatibilités PG18 / PG16
+La base source (`demo-db`) tourne sous PostgreSQL 18.4, tandis que la base cible (`vet-db`) tourne sous PostgreSQL 16 Alpine. L'utilitaire `pg_dump` de PG18 génère une instruction `SET transaction_timeout = 0;` inconnue de PG16.
+Le conteneur du Job résout ce problème à la volée avant injection :
 
-Le job repose sur trois principes d'ingénierie robustes :
-1. **Extraction Ciblée & Granulaire** :
-   ```bash
-   pg_dump -h demo-db.default.svc.cluster.local -U user -d petclinic \
-     --data-only --inserts \
-     -t vets -t specialties -t vet_specialties \
-     --file=/tmp/historical-vets.sql
-   ```
-2. **Résolution des Incompatibilités de Version** :
-   La base source PostgreSQL 18 génère des instructions `SET transaction_timeout = 0;` non reconnues par la base cible PostgreSQL 16. Le job applique un filtre en mémoire :
-   ```bash
-   sed '/^SET transaction_timeout = /d' /tmp/historical-vets.sql > /tmp/historical-vets-pg16.sql
-   ```
-3. **Atomicité & Contrôle d'Intégrité Strict** :
-   L'injection se fait via `--single-transaction --set=ON_ERROR_STOP=1`. Si un seul enregistrement échoue, l'intégralité de l'opération est annulée (*rollback*). À la fin, le script compare les comptages :
-   ```bash
-   test "$SRC_COUNTS" = "$DST_COUNTS"
-   ```
+```bash
+# 1. Extraction granulaire des tables du domaine
+pg_dump -h demo-db.default.svc.cluster.local -U user -d petclinic \
+  --data-only --inserts \
+  -t vets -t specialties -t vet_specialties \
+  --file=/tmp/historical-vets.sql
+
+# 2. Adaptation syntaxique multi-versions
+sed '/^SET transaction_timeout = /d' /tmp/historical-vets.sql > /tmp/historical-vets-pg16.sql
+
+# 3. Injection atomique (Rollback complet si la moindre erreur survient)
+psql -X --no-psqlrc --single-transaction --set=ON_ERROR_STOP=1 \
+  -h vet-db.microservices.svc.cluster.local -U vetuser -d vetdb \
+  -c "TRUNCATE TABLE vet_specialties, vets, specialties RESTART IDENTITY" \
+  --file=/tmp/historical-vets-pg16.sql
+```
+
+### Contrôle d'Intégrité Strict & Assertions
+Pour éliminer tout risque de migration partielle, le script calcule une empreinte de volumétrie sur les deux bases et valide la stricte égalité avant de terminer :
+```bash
+SRC_COUNTS=$(psql -h "$SRC" -U user -d petclinic -XAt \
+  -c "SELECT (SELECT count(*) FROM vets) || ':' || (SELECT count(*) FROM specialties) || ':' || (SELECT count(*) FROM vet_specialties)")
+
+DST_COUNTS=$(psql -h "$DST" -U vetuser -d vetdb -XAt \
+  -c "SELECT (SELECT count(*) FROM vets) || ':' || (SELECT count(*) FROM specialties) || ':' || (SELECT count(*) FROM vet_specialties)")
+
+test "$SRC_COUNTS" = "$DST_COUNTS"
+```
 
 ---
 
-## 8. Phase 2 de Migration : Synchronisation Continue via CDC (Change Data Capture) & Apache Kafka
+## Phase 2 : Synchronisation Continue via CDC & Apache Kafka
 
-Une fois l'historique importé, des écritures continuent de survenir sur le monolithe. Comment propager ces modifications vers `vet-db` sans modifier le code de l'application legacy ?
+Pendant la phase de transition, des écritures continuent de survenir sur le monolithe. Les modifications doivent être répliquées en continu vers la nouvelle base sans double écriture applicative.
 
-### 8.1. Le Problème Fondamental du Dual-Write
+### L'Antipattern du Dual-Write & Décodage Logique du WAL
 
-Demander à une application d'écrire dans deux bases de données simultanément est voué à l'échec en environnement distribué :
-- Si l'écriture dans la base 1 réussit mais que le réseau coupe lors de l'écriture dans la base 2, les données divergent irrémédiablement.
-- Les transactions distribuées (Two-Phase Commit / 2PC) créent un goulet d'étranglement inacceptable en termes de latence et de scalabilité.
+```mermaid
+sequenceDiagram
+    participant App as Monolithe Legacy
+    participant DB as demo-db
+    participant Net as Réseau Interne
+    participant VetDB as vet-db
 
-### 8.2. Le Patron CDC (Change Data Capture)
+    Note over App: Antipattern du Dual-Write
+    App->>DB: 1. INSERT réussi
+    App--xNet: 2. Appel API vers vet-db (TIMEOUT / CRASH)
+    Note over DB,VetDB: Désynchronisation critique et définitive !
+```
 
-La solution consiste à écouter le journal de transactions (**WAL** pour *Write-Ahead Log*) du moteur de base de données source. Toute transaction validée (*committed*) y est inscrite de manière immuable.
+Le **Dual-Write** (demander au monolithe d'écrire en base locale ET d'envoyer un appel réseau au microservice) est proscrit. En cas de crash ou timeout réseau, les bases divergent irrémédiablement.
+
+**La Solution : Change Data Capture (CDC)**  
+PostgreSQL consigne toute transaction validée dans son journal physique **WAL** (*Write-Ahead Log*). En configurant PostgreSQL avec `wal_level=logical`, le moteur expose un flux de réplication logique via l'extension native `pgoutput`. L'application legacy n'a aucune ligne de code modifiée.
 
 ```mermaid
 flowchart LR
-    subgraph PostgreSQL Source
-        Mono[Monolithe] -->|Commit SQL| DB[(demo-db)]
-        DB -->|Transactions| WAL[Journal WAL]
-    end
-
-    subgraph Pipeline CDC
-        WAL -->|Décodage logique pgoutput| Deb[Debezium Connector]
-        Deb -->|Événements JSON| Topic[Kafka Topic: petclinic-vet-cdc.public.vets]
-        Topic -->|Consommation| Sink[JDBC Sink Connector]
-    end
-
-    subgraph Base Cible
-        Sink -->|Upsert SQL| TargetDB[(vet-db)]
-    end
+    App[Monolithe] -->|Écriture SQL standard| PG[(demo-db)]
+    PG -->|Génération native| WAL[Journal WAL]
+    WAL -->|Lecture passive pgoutput| Deb[Debezium Source Connector]
+    Deb -->|Événement JSON| Topic[(Topic Kafka : petclinic-vet-cdc)]
+    Topic -->|Consommation| Sink[JDBC Sink Connector]
+    Sink -->|Upsert SQL| Target[(vet-db)]
 ```
 
-### 8.3. Configuration de l'Infrastructure CDC
+### Cluster Kafka KRaft & Opérateur Strimzi
 
-Toute la chaîne a été construite et déployée de manière déclarative avec l'opérateur **Strimzi** ([k8s/kafka.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/kafka.yml)) :
+L'infrastructure d'événements est orchestrée de façon déclarative par l'opérateur **Strimzi** sous Kubernetes ([k8s/kafka.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/kafka.yml)) :
+- **Mode KRaft** : Suppression totale de ZooKeeper pour une empreinte mémoire réduite et une résilience accrue.
+- **NodePool Déclaratif** : Déploiement d'un broker optimisé avec listener plain sur le port 9092.
 
-#### A. Préparation de la base source PostgreSQL ([k8s/db.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/db.yml))
-PostgreSQL doit être démarré avec les arguments de réplication logique activés :
-```yaml
-containers:
-  - image: postgres:18.4
-    name: postgresql
-    args: 
-      - "-c"
-      - "wal_level=logical"
-      - "-c"
-      - "max_replication_slots=4"
-      - "-c"
-      - "max_wal_senders=4"
-```
+### Image Dérivée Kafka Connect & Connecteurs Déclaratifs
 
-#### B. Apache Kafka en mode KRaft
-Kafka est déployé sans ZooKeeper via la ressource `KafkaNodePool` :
-- Architecture simplifiée à un seul broker pour limiter la consommation mémoire.
-- Listener interne non chiffré sur le port 9092 pour des performances optimales à l'intérieur du réseau Kubernetes.
-
-#### C. L'Image personnalisée Kafka Connect ([k8s/debezium-connect.Dockerfile](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/debezium-connect.Dockerfile))
-Strimzi ne contient pas les connecteurs par défaut. Une image dérivée a été générée :
+L'image officielle Strimzi n'embarque pas les connecteurs tiers. Une image dérivée a été compilée ([k8s/debezium-connect.Dockerfile](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/debezium-connect.Dockerfile)) :
 ```dockerfile
 FROM quay.io/strimzi/kafka:1.3.0-kafka-4.3.1
 USER root:root
-# Ajout du plugin Debezium PostgreSQL Connector
-RUN mkdir -p /opt/kafka/plugins/debezium-postgres && ...
-# Ajout du plugin Debezium JDBC Sink Connector + Driver PostgreSQL JDBC
-RUN mkdir -p /opt/kafka/plugins/debezium-jdbc && ...
+RUN mkdir -p /opt/kafka/plugins/debezium-postgres \
+    && curl -fL --output /tmp/debezium-postgres.tgz https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/3.7.0.Final/debezium-connector-postgres-3.7.0.Final-plugin.tar.gz \
+    && tar -xzf /tmp/debezium-postgres.tgz -C /opt/kafka/plugins/debezium-postgres \
+    && mkdir -p /opt/kafka/plugins/debezium-jdbc \
+    && curl -fL --output /tmp/debezium-jdbc.tgz https://repo.maven.apache.org/maven2/io/debezium/debezium-connector-jdbc/3.7.0.Final/debezium-connector-jdbc-3.7.0.Final-plugin.tar.gz \
+    && tar -xzf /tmp/debezium-jdbc.tgz -C /opt/kafka/plugins/debezium-jdbc \
+    && curl -fL --output /opt/kafka/plugins/debezium-jdbc/postgresql-42.7.7.jar https://repo.maven.apache.org/maven2/org/postgresql/postgresql/42.7.7/postgresql-42.7.7.jar \
+    && rm -f /tmp/debezium-postgres.tgz /tmp/debezium-jdbc.tgz
 USER 1001
 ```
 
-#### D. Le Connecteur Source Debezium
-Le connecteur `petclinic-postgres-source` surveille en continu la base source :
+### Connecteur Debezium Source (PostgreSQL)
+
+Le connecteur source capture en temps réel les deltas sur les tables cibles :
 ```yaml
 apiVersion: kafka.strimzi.io/v1
 kind: KafkaConnector
 metadata:
   name: petclinic-postgres-source
+  namespace: kafka
 spec:
   class: io.debezium.connector.postgresql.PostgresConnector
+  tasksMax: 1
   config:
     database.hostname: demo-db.default.svc.cluster.local
+    database.port: 5432
+    database.dbname: petclinic
+    topic.prefix: petclinic-vet-cdc
+    table.include.list: "public.vets,public.specialties,public.vet_specialties"
     plugin.name: pgoutput
     slot.name: debezium_petclinic
     publication.name: debezium_pub
-    topic.prefix: petclinic-vet-cdc
-    table.include.list: "public.vets,public.specialties,public.vet_specialties"
-    # Évite de rejouer tout l'historique car le Job s'en est déjà chargé
-    snapshot.mode: no_data
+    publication.autocreate.mode: filtered
+    snapshot.mode: no_data # Évite la surcharge du snapshot initial déjà traité par le Job
 ```
 
-#### E. Le Connecteur JDBC Sink (Vers `vet-db`)
-Le connecteur `vet-vets-sink` consomme le topic Kafka et écrit dans `vet-db` :
+### Connecteur Debezium JDBC Sink & Idempotence par Upsert
+
+Le connecteur Sink lit le topic Kafka et applique les modifications dans `vet-db` :
 ```yaml
 apiVersion: kafka.strimzi.io/v1
 kind: KafkaConnector
 metadata:
   name: vet-vets-sink
+  namespace: kafka
 spec:
   class: io.debezium.connector.jdbc.JdbcSinkConnector
+  tasksMax: 1
   config:
     topics: petclinic-vet-cdc.public.vets
     connection.url: jdbc:postgresql://vet-db.microservices.svc.cluster.local:5432/vetdb
+    connection.username: ${secrets:kafka/vet-db-sink:username}
+    connection.password: ${secrets:kafka/vet-db-sink:password}
     insert.mode: upsert
     primary.key.mode: record_key
     primary.key.fields: id
     table.name.format: vets
 ```
-> **Le rôle crucial du mode `upsert`** : Si un enregistrement existe déjà, il est mis à jour (`UPDATE`). S'il n'existe pas, il est inséré (`INSERT`). Cela garantit l'idempotence totale de la réplication, même en cas de rejeu d'événements.
+> **Garantie d'Idempotence** : Grâce à `insert.mode: upsert`, si un événement est rejoué suite à une reprise sur incident, la ligne est mise à jour plutôt que de déclencher une violation de clé unique.
 
 ---
 
-## 9. Analyse des Incidents Réels, Contraintes Opérationnelles & Optimisations
+# Section 4 : Incidents Opérationnels Résolus & Retours d'Expérience
 
-La mise en œuvre sur un cluster de développement (Minikube sous Windows) a mis en lumière des problématiques de production réelles :
+Durant la mise en œuvre de cette plateforme sur un nœud Kubernetes contraint, plusieurs défis techniques réels ont été surmontés :
 
-### 1. Gestion de la Pression Mémoire et des JVMs
-* **Symptôme** : Les pods Kafka, Entity Operator et Debezium Connect ont subi des cycles de `CrashLoopBackOff` dus à des dépassements de mémoire (*OOMKilled*).
-* **Cause racine** : Par défaut, la machine virtuelle Java (JVM) tente d'allouer une fraction importante de la mémoire hôte si aucune limite n'est explicitement fixée.
-* **Correction appliquée** :
-  - Définition stricte des options JVM `-Xms` et `-Xmx` dans les manifestes Strimzi :
+### 1. Résolution des CrashLoopBackOff & Dimensionnement JVM
+* **Problème** : Les pods Kafka, Topic Operator et Debezium Connect redémarraient fréquemment (`Exit Code 137 - OOMKilled`).
+* **Analyse** : Les runtimes Java sous conteneur tendent à réserver une mémoire virtuelle excessive si les flags JVM ne sont pas explicitement bridés.
+* **Résolution** :
+  - Bridage direct du tas JVM dans les manifestes Strimzi :
     - Kafka Broker : `-Xms: 256m`, `-Xmx: 384m`
     - Kafka Connect : `-Xms: 256m`, `-Xmx: 512m`
-  - Alignement des `resources.requests` et `resources.limits` Kubernetes pour éviter l'éviction par le kubelet.
+  - Augmentation des seuils de liveness/readiness probes (`initialDelaySeconds: 180`) pour tolérer le démarrage sur disque lent.
 
-### 2. Découplage "Historique" vs "CDC" (`snapshot.mode: no_data`)
-* **Symptôme** : Au premier démarrage, Debezium tente par défaut d'effectuer un snapshot initial complet de la base en posant des verrous de lecture. Sur de grosses bases, ce snapshot peut saturer la mémoire et bloquer les écritures.
-* **Solution retenue** : Séparation stricte des responsabilités. Le chargement initial est confié au **Job one-shot** optimisé via `pg_dump`. Debezium est configuré avec `snapshot.mode: no_data`, se concentrant uniquement sur la capture des deltas futurs.
+### 2. Découplage de Snapshot (`snapshot.mode: no_data`)
+* **Problème** : Au démarrage, Debezium effectue par défaut un snapshot complet en verrouillant les tables pour garantir la consistance, provoquant des timeouts sur l'application.
+* **Résolution** : Séparation stricte des responsabilités. Le chargement initial est dévolu au **Job Kubernetes batch**, et Debezium démarre directement en mode streaming passif via `snapshot.mode: no_data`.
+
+### 3. Gestion Déclarative des Secrets RBAC
+* **Problème** : Kafka Connect doit s'authentifier auprès de `vet-db` sans exposer les mots de passe en clair dans les CRDs.
+* **Résolution** : Mise en place d'un `Role` et `RoleBinding` Kubernetes autorisant le compte de service `debezium-connect-connect` à lire le secret `vet-db-sink`, consommé via l'interpoleur `${secrets:kafka/vet-db-sink:password}`.
 
 ---
 
-## 10. Guide d'Exploitation et Déploiement Reproductible
+# Section 5 : Guide d'Exploitation & Déploiement Reproductible
 
-Pour rejouer l'ensemble de cette architecture sur un cluster Kubernetes vierge :
+## Matrice des Dépendances & Prérequis
+- Kubernetes v1.28+ (Minikube ou cluster Cloud managé)
+- `kubectl` configuré
+- Minimum 4 CPU / 8 Go de RAM alloués à la VM Kubernetes
 
-### Étape 1 : Créer les Espaces de Noms
+---
+
+## Déploiement Séquentiel Pas à Pas
+
+### Étape 1 : Initialisation des Espaces de Noms
 ```bash
 kubectl apply -f k8s/00-namespaces.yml
 ```
 
-### Étape 2 : Déployer le Monolithe et la Base Source
+### Étape 2 : Déploiement du Socle Monolithe & BDD Source
 ```bash
 kubectl apply -f k8s/db.yml
 kubectl apply -f k8s/petclinic.yml
+kubectl wait --for=condition=ready pod -l app=demo-db -n default --timeout=120s
 ```
 
-### Étape 3 : Déployer le Microservice et sa Base Dédiée
+### Étape 3 : Déploiement du Microservice & BDD Dédiée
 ```bash
 kubectl apply -f k8s/vet-service.yml
+kubectl wait --for=condition=ready pod -l app=vet-db -n microservices --timeout=120s
 ```
 
-### Étape 4 : Exécuter la Migration des Données Historiques
+### Étape 4 : Exécution du Job de Migration Historique
 ```bash
 kubectl apply -f k8s/migrate-historical-data-job.yml
-# Vérifier la réussite du job
-kubectl wait --for=condition=complete job/migrate-historical-vets -n default --timeout=120s
+kubectl wait --for=condition=complete job/migrate-historical-vets -n default --timeout=180s
 ```
 
-### Étape 5 : Déployer le Cluster Kafka et les Connecteurs CDC
+### Étape 5 : Déploiement du Pipeline CDC & Kafka
 ```bash
+# Construction locale de l'image Debezium (si Minikube)
+minikube image build -t debezium-connect:3.7.0-cdc1 -f k8s/debezium-connect.Dockerfile .
+
+# Déploiement de Strimzi et des connecteurs
 kubectl apply -f k8s/kafka.yml
 ```
 
-### Étape 6 : Activer la Passerelle de Routage (API Gateway)
+### Étape 6 : Activation de l'API Gateway Nginx
 ```bash
 kubectl apply -f k8s/gateway.yml
+kubectl wait --for=condition=ready pod -l app=gateway -n gateway --timeout=90s
 ```
 
 ---
 
-## 11. Conclusion & Synthèse Comparative
+## Validation & Cahier de Recette Postman
 
-Ce projet démontre qu'une migration vers les microservices n'est pas une rupture brutale, mais une transition progressive orchestrée par des composants d'infrastructure spécialisés.
+Pour valider l'architecture de bout en bout, ouvrez un port-forward local vers la Gateway :
 
-| Critère d'Évaluation | Approche Classique "Big Bang" | Notre Approche "Strangler Fig + CDC" |
-| :--- | :--- | :--- |
-| **Indisponibilité Utilisateur** | Heures ou jours de coupure planifiée | **Zero-Downtime** (bascule transparente à chaud) |
-| **Risque d'Échec Global** | Extrêmement élevé (retour arrière difficile) | **Quasi nul** (fallback automatique sur le monolithe) |
-| **Intégrité des Données** | Risque fort de désynchronisation | **Garantie** par le WAL de Postgres et les Upserts Kafka |
-| **Impact sur le Code Legacy** | Refactorisation lourde et risquée | **Zéro modification de code** sur le monolithe |
-| **Validation du Domaine** | Tout le système est testé d'un coup | **Validation isolée** du domaine `vets` avant d'étendre la démarche |
+```powershell
+kubectl port-forward -n gateway svc/gateway 8080:80
+```
 
-L'infrastructure mise en place offre un gabarit (*blueprint*) directement réutilisable pour extraire les domaines suivants (`visits`, `owners`, `pets`) selon le même standard d'excellence industrielle.
+### 1. Test de Santé de la Gateway
+* **Requête** : `GET http://localhost:8080/healthz`
+* **Résultat Attendu** : `200 OK` (`ok`).
+
+### 2. Validation du Routage Microservice (Données Migrées)
+* **Requête** : `GET http://localhost:8080/vets` (Header: `Accept: application/json`)
+* **Résultat Attendu** : `200 OK` avec le tableau JSON issu de `vet-db`.
+
+### 3. Validation de Non-Régression sur le Monolithe
+* **Requête** : `GET http://localhost:8080/owners`
+* **Résultat Attendu** : `200 OK` servie par le monolithe legacy.
+* **Requête Web** : `GET http://localhost:8080/vets.html`
+* **Résultat Attendu** : Page HTML Thymeleaf servie par le monolithe.
+
+### 4. Crash-Test de Résilience Zéro-Downtime
+1. Simulez l'arrêt brutal du microservice :
+   ```bash
+   kubectl scale deployment vet-service -n microservices --replicas=0
+   ```
+2. Rejouez immédiatement `GET http://localhost:8080/vets` :
+   - **Résultat** : Toujours `200 OK` ! Nginx a détecté la coupure et a redirigé le trafic vers le monolithe en `backup` de façon transparente.
+3. Rétablissez le microservice :
+   ```bash
+   kubectl scale deployment vet-service -n microservices --replicas=1
+   ```
+
+---
+
+<div align="center">
+
+**Cette usine de migration fournit une architecture prête pour la production, éprouvée contre les pannes et prête à accueillir le découpage des domaines suivants (`visits`, `owners`, `pets`).**
+
+</div>
