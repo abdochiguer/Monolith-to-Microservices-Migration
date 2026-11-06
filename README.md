@@ -87,8 +87,8 @@ Dans les architectures logicielles traditionnelles, le **Monolithe** centralise 
 ```mermaid
 graph LR
     subgraph Approche Déconseillée : Le Big Bang
-        Old[Monolithe Historique] -. Interruption de Service .-> Tunnel[6 à 12 Mois d'Effet Tunnel]
-        Tunnel -. Bascule Unique 100% .-> Risk[Risque Critique : Bugs, Pertes de Données, Rollback Impossible]
+        Old[Monolithe Historique] -.->|Interruption de Service| Tunnel[6 à 12 Mois d'Effet Tunnel]
+        Tunnel -.->|Bascule Unique 100%| Risk[Risque Critique : Bugs, Pertes de Données, Rollback Impossible]
     end
 ```
 
@@ -174,10 +174,10 @@ graph TB
     GatewayPod -.->|3. Fallback immédiat si 502/503| MonolithPod
 
     %% Flux de Données
-    MigrationJob -. 1. Extraction One-Shot .-> DemoDB
-    MigrationJob -. 2. Injection Atomique .-> VetDB
-    ConnectPod -. Capture WAL continue .-> DemoDB
-    ConnectPod -. Upsert en streaming .-> VetDB
+    MigrationJob -.->|1. Extraction One-Shot| DemoDB
+    MigrationJob -.->|2. Injection Atomique| VetDB
+    ConnectPod -.->|Capture WAL continue| DemoDB
+    ConnectPod -.->|Upsert en streaming| VetDB
 ```
 
 ---
