@@ -28,6 +28,7 @@ Ce projet constitue une **implémentation réelle, complète et prête pour la p
 - [Topologie des Espaces de Noms (Namespaces K8s)](#topologie-des-espaces-de-noms-namespaces-k8s)
 - [L'API Gateway Nginx : L'Aiguillage Intelligent](#lapi-gateway-nginx--laiguillage-intelligent)
 - [Mécanisme de Secours Transparent (Fallback Zero-Downtime)](#mécanisme-de-secours-transparent-fallback-zero-downtime)
+- [Le Déploiement Canary : Bascule Progressive du Trafic](#le-déploiement-canary--bascule-progressive-du-trafic)
 
 ### [Section III : Découpage des Données & Pipeline de Synchronisation](#section-iii--découpage-des-données--pipeline-de-synchronisation)
 - [Le Modèle Database-per-Service](#le-modèle-database-per-service)
@@ -276,6 +277,51 @@ La combinaison de `server petclinic.default.svc.cluster.local:80 backup;` et de 
    - Nginx intercepte l'erreur instantanément en interne.
    - La requête est immédiatement réémise vers le monolithe historique en mode `backup`.
    - **Le client final reçoit une réponse HTTP 200 valide sans jamais s'apercevoir de l'incident.**
+
+---
+
+## Le Déploiement Canary : Bascule Progressive du Trafic
+
+Même lorsque le microservice est fonctionnel et synchronisé via le pipeline CDC, basculer immédiatement 100% du trafic d'un coup demeure une prise de risque. L'architecture introduit une stratégie de **Canary Deployment** (Déploiement Canari) permettant de tester et d'augmenter graduellement la charge sur la nouvelle stack.
+
+```mermaid
+flowchart TD
+    ClientTraffic[Trafic Global Utilisateurs / Simulateur] --> IngressRouter[Nginx Router / Ingress]
+
+    IngressRouter -->|90% Trafic Standard Stable| MonolithProd[Monolithe Stable : petclinic]
+    IngressRouter -->|10% Trafic Canary : Header X-Canary| CanaryPod[Pod Canary : petclinic-canary]
+
+    CanaryPod -->|Délégation HTTP REST via RestClient| VetMicroservice[Microservice : vet-service]
+    VetMicroservice --> VetDatabase[(vet-db)]
+
+    subgraph Observabilité & Détection Précoce
+        PrometheusAlerts[Prometheus & Grafana] -. Surveillance 5xx & Latence .-> CanaryPod
+        PrometheusAlerts -. Surveillance 5xx & Latence .-> VetMicroservice
+    end
+```
+
+### 1. Implémentation du Pod Canary ([k8s/petclinic-canary.yml](file:///c:/Users/chigu/projects/Migration/spring-petclinic/k8s/petclinic-canary.yml))
+Un déploiement spécifique `petclinic-canary` tourne en parallèle du monolithe principal :
+- Utilise l'image `petclinic:canary-cdc2`.
+- Active la délégation vers le microservice via ses variables d'environnement Spring Boot :
+  ```json
+  "petclinic.services.vet.base-url": "http://vet-service.microservices.svc.cluster.local:8080",
+  "petclinic.services.vet.connect-timeout": "2s",
+  "petclinic.services.vet.read-timeout": "15s"
+  ```
+- Déploiement managé par `RollingUpdate` avec `maxUnavailable: 0` pour garantir la disponibilité constante.
+
+### 2. Délégation Intelligente & Circuit Breaker Applicatif
+Au niveau du code Java ([VetServiceClient.java](file:///c:/Users/chigu/projects/Migration/spring-petclinic/src/main/java/org/springframework/samples/petclinic/vet/VetServiceClient.java) et [VetController.java](file:///c:/Users/chigu/projects/Migration/spring-petclinic/src/main/java/org/springframework/samples/petclinic/vet/VetController.java)) :
+- Lorsque le client REST vers `vet-service` est actif (pod Canary), le contrôleur délègue la requête au microservice.
+- **Résilience applicative** : En cas de timeout ou d'indisponibilité du microservice, le contrôleur intercepte l'exception (`RestClientException`) et retombe automatiquement sur le `VetRepository` local (base monolithique locale) pour ne jamais renvoyer d'erreur 500 à l'utilisateur.
+
+### 3. Matrice de Progression du Trafic
+Le basculement suit une progression maîtrisée :
+1. **Étape 1 (Smoke Tests - 0%)** : Le pod canary est déployé. Seuls les tests internes portant l'en-tête `X-Canary: true` sollicitent la nouvelle stack.
+2. **Étape 2 (Bascule Échantillon - 10%)** : Activation d'un poids de trafic de 10% (`canary-weight: 10`). Les dashboards Grafana et l'alerte Prometheus `HighHttp5xxRate` valident la stabilité.
+3. **Étape 3 (Montée en Charge - 50%)** : Validation sous charge réelle sans hausse de latence.
+4. **Étape 4 (Bascule Définitive - 100%)** : La route `/vets` de l'API Gateway pointe à 100% directement sur `vet-service`, et le pod canary peut être décommissionné.
 
 ---
 
