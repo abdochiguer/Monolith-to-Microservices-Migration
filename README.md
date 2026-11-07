@@ -4,8 +4,8 @@
 
 ---
 
-# Monolith to Microservices Migration Platform
-### Strangler Fig Pattern, Change Data Capture (CDC), Kafka KRaft Replication & Full Observability Stack (Prometheus/Grafana/EFK) on Kubernetes
+# StranglerFlow: Zero-Downtime Monolith-to-Microservices Migration Environment
+### Event-Driven Decomposition via Strangler Fig, Debezium CDC, Kafka KRaft & Full Observability on Kubernetes
 
 This project provides a **complete, production-grade implementation** for decomposing a monolithic enterprise application into a distributed microservices architecture on **Kubernetes**, ensuring:
 1. **Total Business Continuity (Zero-Downtime)** with no service interruption for end users.
@@ -117,66 +117,54 @@ flowchart TD
 
 ## Target Architecture & System Overview
 
-The target infrastructure deploys all application services, data engineering pipelines, and observability layers on Kubernetes:
+The complete production architecture deployed on the Kubernetes cluster is represented below, orchestrating the Ingress Gateway, the legacy monolith, the extracted microservice, the CDC streaming engine, and the end-to-end monitoring/logging stacks:
 
-```mermaid
-graph TB
-    Client([Users / Browsers / API Clients]) --> Ingress[Kubernetes Ingress Controller]
+<div align="center">
 
-    subgraph "Namespace: gateway"
-        Ingress --> GW_Svc[Service: gateway :80]
-        GW_Svc --> GW_Pod[Pod: Nginx Smart Gateway]
-    end
+![Target Kubernetes Architecture](docs/assets/architecture.jpg)
 
-    subgraph "Namespace: default (Legacy)"
-        Mono_Pod[Pod: Monolith petclinic]
-        DemoDB[(demo-db PostgreSQL 18 : WAL Logical)]
-        Mono_Pod --> DemoDB
-    end
+*Figure: Complete Production Kubernetes Architecture on Worker Node — Ingress Routing, Strangler Fig, CDC Kafka Pipeline & Observability Stack*
 
-    subgraph "Namespace: microservices (Modern Stack)"
-        Vet_Pod[Pod: vet-service]
-        VetDB[(vet-db PostgreSQL 16)]
-        Vet_Pod --> VetDB
-    end
+</div>
 
-    subgraph "Namespace: kafka (Data Streaming & CDC)"
-        KafkaBroker[(Pod: petclinic-kafka KRaft)]
-        DebeziumConnect[Pod: debezium-connect]
-        DebeziumConnect <--> KafkaBroker
-    end
+### Architectural Highlights & Key Notes (from the Diagram)
 
-    subgraph "Namespace: monitoring (Metrics & Alerts)"
-        Prometheus[Pod: Prometheus TSDB]
-        Alertmgr[Pod: Alertmanager]
-        Grafana[Pod: Grafana Dashboards]
-        Prometheus --> Alertmgr
-        Grafana --> Prometheus
-    end
+#### 1. Ingress & Smart Gateway (`gateway` Namespace)
+* **Path-Based Traffic Splitting:**
+  * Requests matching `/vets/*` (such as `/vets/1/specialties?format=json`) are routed directly to the new `vet-service` microservice.
+  * All other domain routes (`/owners/*`, `/pets/*`, `/visits/*`) and the legacy server-rendered template `/vets.html` remain routed to the `petclinic` monolith.
+* **Active Zero-Downtime Fallback (502 / 503 Resiliency):**
+  * Configured via Nginx `proxy_next_upstream error timeout http_502 http_503 http_504;` and `server petclinic.default.svc.cluster.local:80 backup;`.
+  * If the `vet-service` pod crashes, encounters an Out-Of-Memory failure (`OOMKilled`), or enters a rolling restart, Nginx immediately and transparently replays the request against the monolith. **End users never see an HTTP 502 or 503 outage.**
 
-    subgraph "Namespace: logging (Centralized Logs - EFK)"
-        Fluentd[DaemonSet: Fluentd Collector]
-        Elasticsearch[(Pod: Elasticsearch 8.10)]
-        Kibana[Pod: Kibana Web UI]
-        Fluentd --> Elasticsearch
-        Kibana --> Elasticsearch
-    end
+#### 2. Legacy Monolith & Initial Historical Migration (`default` Namespace)
+* **Monolith Workload:** The Spring PetClinic application runs alongside its PostgreSQL database (`demo-db`).
+* **Step 1: Batch Historical Seeding (`Migrate-historical-vets` Job):**
+  * An automated, one-shot Kubernetes Job extracts records from domain tables (`vets`, `specialties`, `vet_specialties`).
+  * Injects the dataset into `vet-db` inside an atomic transaction (`--single-transaction`).
+  * Strips PostgreSQL 18-specific syntax (`SET transaction_timeout = 0;`) using an inline `sed` filter for compatibility with PostgreSQL 16.
+  * Enforces a strict blocking row-count verification assertion (`test $SRC_COUNTS == $DST_COUNTS`).
 
-    %% Network & Business Flow
-    GW_Pod -->|1. REST API Route /vets| Vet_Pod
-    GW_Pod -->|2. Fallback & Default / & HTML| Mono_Pod
-    GW_Pod -.->|3. Invisible Fallback on 502/503| Mono_Pod
+#### 3. Real-Time Data Streaming & CDC (`kafka` Namespace)
+* **Step 2: Continuous Real-Time CDC Replication:**
+  * **Dual-Write Prevention:** The monolith code remains completely untouched. PostgreSQL writes committed transactions to its internal Write-Ahead Log (**WAL**).
+  * **Debezium Source Connector:** Tail-reads the WAL using the native `pgoutput` logical replication plugin and publishes change events as JSON messages into Kafka.
+  * **Kafka Broker (KRaft Mode):** Operates on a single lightweight node without ZooKeeper dependency, minimizing memory footprints.
+  * **Debezium JDBC Sink Connector:** Consumes the `petclinic-vet-cdc.public.vets` topic and performs an **Idempotent Upsert** (`INSERT` or `UPDATE`) on primary key `id` directly into `vet-db`.
 
-    %% Data Synchronization Flow
-    DebeziumConnect -.->|Passive WAL Capture| DemoDB
-    DebeziumConnect -.->|Streaming Upsert| VetDB
+#### 4. Modern Decoupled Domain (`microservices` Namespace)
+* **Database-per-Service Isolation:** `vet-service` connects exclusively to its dedicated PostgreSQL 16 database (`vet-db`), backed by an isolated 2Gi PersistentVolumeClaim (`vet-db-data`).
+* **Canary Progression:** Designed to support gradual traffic shifting (10% $\rightarrow$ 50% $\rightarrow$ 100%) prior to final monolith decommissioning.
 
-    %% Observability Scrapes
-    Prometheus -. Scrape /actuator/prometheus .-> Mono_Pod
-    Prometheus -. Scrape /actuator/prometheus .-> Vet_Pod
-    Fluentd -. Collect Container Logs .-> Mono_Pod
-    Fluentd -. Collect Container Logs .-> Vet_Pod
-```
+#### 5. Unified Enterprise Observability (`monitoring` & `logging` Namespaces)
+* **Logging Stack (EFK):**
+  * **Fluentd (DaemonSet):** Deployed on each cluster worker node, tailing `/var/log/containers/*.log`, enriching records with Kubernetes pod metadata.
+  * **Elasticsearch (StatefulSet/Pod):** Ingests and indexes logs with persistent volume storage and bounded JVM heaps.
+  * **Kibana (Deployment):** Web analytics interface to search, filter, and trace errors across all microservices and monolith components.
+* **Monitoring Stack:**
+  * **Prometheus (StatefulSet/Pod):** Scrapes Spring Boot Actuator endpoints (`/actuator/prometheus`) every 15s.
+  * **Alertmanager (StatefulSet/Pod):** Evaluates alert rules (`ServiceDown`, `HighHttp5xxRate`, `PodFrequentRestarts`) and dispatches TLS-encrypted alerts to administrator mailboxes.
+  * **Grafana (Deployment):** Pre-provisioned dashboards for live visual monitoring of latency, throughput, and memory consumption.
 
 ---
 
