@@ -356,6 +356,14 @@ sequenceDiagram
 
 ## Phase 2: Continuous Real-Time CDC Synchronization (Debezium & Kafka KRaft)
 
+<div align="center">
+
+![Change Data Capture Pipeline Architecture](docs/assets/cdc-pipeline.jpg)
+
+*Figure: End-to-End Real-Time CDC Streaming Pipeline — PostgreSQL Logical Decoding (WAL), Debezium Source, Kafka KRaft Topic & JDBC Sink Upsert*
+
+</div>
+
 ### The Dual-Write Antipattern & PostgreSQL WAL
 
 ```mermaid
