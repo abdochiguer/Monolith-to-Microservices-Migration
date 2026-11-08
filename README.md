@@ -471,7 +471,7 @@ For distributed log aggregation and trace correlation, an **EFK** stack is deplo
 ```mermaid
 flowchart LR
     subgraph Kubernetes Nodes
-        AppLogs[/var/log/containers/*.log]
+        AppLogs["/var/log/containers/*.log"]
     end
 
     subgraph Logging DaemonSet
